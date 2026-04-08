@@ -38,6 +38,7 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS turns (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id              TEXT,
+            message_id              TEXT,
             timestamp               TEXT,
             model                   TEXT,
             input_tokens            INTEGER DEFAULT 0,
@@ -58,6 +59,20 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
     """)
+
+    # Add message_id column if upgrading from older schema
+    try:
+        conn.execute("SELECT message_id FROM turns LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE turns ADD COLUMN message_id TEXT")
+
+    # Add unique index on message_id to prevent cross-file duplicates
+    # (e.g. aside_question subagents that replay parent message IDs)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
+        ON turns(message_id) WHERE message_id IS NOT NULL AND message_id != ''
+    """)
+
     conn.commit()
 
 
@@ -72,15 +87,27 @@ def project_name_from_cwd(cwd):
     return parts[-1] if parts else "unknown"
 
 
-def parse_jsonl_file(filepath):
-    """Parse a JSONL file and yield (session_data, turns) tuples."""
+def parse_jsonl_file(filepath, skip_lines=0):
+    """Parse a JSONL file and return (session_metas, turns, line_count).
+
+    Args:
+        filepath: Path to the JSONL file.
+        skip_lines: Number of lines to skip from the start (for incremental updates).
+
+    Returns:
+        (session_metas, turns, line_count) where session_metas is a list of dicts,
+        turns is a list of dicts deduplicated by message ID, and line_count is the
+        total number of lines in the file.
+    """
     turns = []
     session_meta = {}  # session_id -> dict
     seen_messages = {}  # message_id -> turn (dedup streaming records)
+    line_count = 0
 
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for i, line in enumerate(f):
+                line_count = i + 1
                 line = line.strip()
                 if not line:
                     continue
@@ -120,6 +147,10 @@ def parse_jsonl_file(filepath):
                     if git_branch and not meta["git_branch"]:
                         meta["git_branch"] = git_branch
 
+                # Only extract turns from new lines
+                if i < skip_lines:
+                    continue
+
                 if rtype == "assistant":
                     msg = record.get("message", {})
                     usage = msg.get("usage", {})
@@ -147,6 +178,7 @@ def parse_jsonl_file(filepath):
 
                     turn = {
                         "session_id": session_id,
+                        "message_id": message_id,
                         "timestamp": timestamp,
                         "model": model,
                         "input_tokens": input_tokens,
@@ -169,7 +201,7 @@ def parse_jsonl_file(filepath):
         print(f"  Warning: error reading {filepath}: {e}")
 
     turns.extend(seen_messages.values())
-    return list(session_meta.values()), turns
+    return list(session_meta.values()), turns, line_count
 
 
 def aggregate_sessions(session_metas, turns):
@@ -249,18 +281,32 @@ def upsert_sessions(conn, sessions):
 
 
 def insert_turns(conn, turns):
-    conn.executemany("""
-        INSERT INTO turns
-            (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        (t["session_id"], t["timestamp"], t["model"],
-         t["input_tokens"], t["output_tokens"],
-         t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"])
-        for t in turns
-    ])
+    """Insert turns, skipping any with a message_id already in the DB.
+
+    Returns the list of turns that were actually inserted (excluding
+    cross-file duplicates caught by the UNIQUE constraint).
+    """
+    inserted = []
+    for t in turns:
+        try:
+            conn.execute("""
+                INSERT INTO turns
+                    (session_id, message_id, timestamp, model, input_tokens,
+                     output_tokens, cache_read_tokens, cache_creation_tokens,
+                     tool_name, cwd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                t["session_id"], t.get("message_id") or None,
+                t["timestamp"], t["model"],
+                t["input_tokens"], t["output_tokens"],
+                t["cache_read_tokens"], t["cache_creation_tokens"],
+                t["tool_name"], t["cwd"]
+            ))
+            inserted.append(t)
+        except sqlite3.IntegrityError:
+            # Duplicate message_id (cross-file, e.g. subagent replaying parent turns)
+            pass
+    return inserted
 
 
 def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
@@ -292,122 +338,43 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
             continue
 
         is_new = row is None
+        old_lines = 0 if is_new else (row["lines"] if row else 0)
+
         if verbose:
             status = "NEW" if is_new else "UPD"
             print(f"  [{status}] {os.path.relpath(filepath, projects_dir)}")
 
-        session_metas, turns = parse_jsonl_file(filepath)
+        # Single parse: always read full file for session metadata,
+        # but only extract turns from new lines (skip_lines=old_lines).
+        session_metas, turns, line_count = parse_jsonl_file(filepath, skip_lines=old_lines)
+
+        # For updated files where the file didn't grow, just update mtime
+        if not is_new and line_count <= old_lines:
+            conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
+                         (mtime, filepath))
+            conn.commit()
+            skipped_files += 1
+            continue
 
         if turns or session_metas:
-            sessions = aggregate_sessions(session_metas, turns)
-
-            # For incremental updates: only insert turns not already in DB
-            if not is_new:
-                # Get existing turns count to detect which are new
-                # Simple approach: delete old turns for these sessions and re-insert
-                # More correct: track file line count and only process new lines
-                old_lines = row["lines"] if row else 0
-                # Re-parse only if file grew
-                current_lines = sum(1 for _ in open(filepath, encoding="utf-8", errors="replace"))
-
-                if current_lines <= old_lines:
-                    conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
-                                 (mtime, filepath))
-                    conn.commit()
-                    skipped_files += 1
-                    continue
-
-                # Only process the new lines
-                new_turns = []
-                new_metas = {}
-                new_seen_messages = {}
-                try:
-                    with open(filepath, encoding="utf-8", errors="replace") as f:
-                        for i, line in enumerate(f):
-                            if i < old_lines:
-                                continue
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                record = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-
-                            rtype = record.get("type")
-                            if rtype != "assistant":
-                                continue
-
-                            session_id = record.get("sessionId")
-                            if not session_id:
-                                continue
-
-                            msg = record.get("message", {})
-                            usage = msg.get("usage", {})
-                            message_id = msg.get("id", "")
-                            input_tokens = usage.get("input_tokens", 0) or 0
-                            output_tokens = usage.get("output_tokens", 0) or 0
-                            cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                            cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-
-                            if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                                continue
-
-                            tool_name = None
-                            for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
-
-                            turn = {
-                                "session_id": session_id,
-                                "timestamp": record.get("timestamp", ""),
-                                "model": msg.get("model", ""),
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_read_tokens": cache_read,
-                                "cache_creation_tokens": cache_creation,
-                                "tool_name": tool_name,
-                                "cwd": record.get("cwd", ""),
-                            }
-
-                            if message_id:
-                                new_seen_messages[message_id] = turn
-                            else:
-                                new_turns.append(turn)
-                except Exception as e:
-                    print(f"  Warning: {e}")
-
-                new_turns.extend(new_seen_messages.values())
-
-                turns = new_turns
-                sessions = aggregate_sessions(list(new_metas.values()) or [], turns)
-                # Update session timestamps from full parse
-                for meta in session_metas:
-                    sessions_to_update = [s for s in sessions if s["session_id"] == meta["session_id"]]
-                    if not sessions_to_update:
-                        # Session exists but no new turns -- still update timestamps
-                        sessions.append({**meta,
-                                         "total_input_tokens": 0,
-                                         "total_output_tokens": 0,
-                                         "total_cache_read": 0,
-                                         "total_cache_creation": 0,
-                                         "turn_count": 0,
-                                         "model": meta.get("model")})
-
-                updated_files += 1
-            else:
+            if is_new:
                 new_files += 1
+            else:
+                updated_files += 1
 
+            # Insert turns first — the UNIQUE constraint on message_id
+            # filters out cross-file duplicates (e.g. subagent replays).
+            # Then aggregate sessions from only the actually-inserted turns
+            # so session totals stay consistent with the turns table.
+            inserted_turns = insert_turns(conn, turns)
+            sessions = aggregate_sessions(session_metas, inserted_turns)
             upsert_sessions(conn, sessions)
-            insert_turns(conn, turns)
 
             for s in sessions:
                 total_sessions.add(s["session_id"])
-            total_turns += len(turns)
+            total_turns += len(inserted_turns)
 
         # Record file as processed
-        line_count = sum(1 for _ in open(filepath, encoding="utf-8", errors="replace"))
         conn.execute("""
             INSERT OR REPLACE INTO processed_files (path, mtime, lines)
             VALUES (?, ?, ?)

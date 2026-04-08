@@ -15,33 +15,40 @@ from datetime import datetime, date
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
+# Anthropic API pricing as of April 2026 ($/MTok)
+# https://claude.com/pricing#api
 PRICING = {
-    "claude-opus-4-6":   {"input": 15.00, "output": 75.00},
-    "claude-opus-4-5":   {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-6": {"input":  3.00, "output": 15.00},
-    "claude-sonnet-4-5": {"input":  3.00, "output": 15.00},
-    "claude-haiku-4-5":  {"input":  0.80, "output":  4.00},
-    "claude-haiku-4-6":  {"input":  0.80, "output":  4.00},
-    "default":           {"input":  3.00, "output": 15.00},
+    "claude-opus-4-6":   {"input": 6.15, "output": 30.75, "cache_write": 7.69, "cache_read": 0.61},
+    "claude-opus-4-5":   {"input": 6.15, "output": 30.75, "cache_write": 7.69, "cache_read": 0.61},
+    "claude-sonnet-4-6": {"input": 3.69, "output": 18.45, "cache_write": 4.61, "cache_read": 0.37},
+    "claude-sonnet-4-5": {"input": 3.69, "output": 18.45, "cache_write": 4.61, "cache_read": 0.37},
+    "claude-haiku-4-5":  {"input": 1.23, "output":  6.15, "cache_write": 1.54, "cache_read": 0.12},
+    "claude-haiku-4-6":  {"input": 1.23, "output":  6.15, "cache_write": 1.54, "cache_read": 0.12},
 }
 
 def get_pricing(model):
     if not model:
-        return PRICING["default"]
+        return None
     if model in PRICING:
         return PRICING[model]
     for key in PRICING:
-        if key != "default" and model.startswith(key):
+        if model.startswith(key):
             return PRICING[key]
-    return PRICING["default"]
+    m = model.lower()
+    if "opus" in m:   return PRICING["claude-opus-4-6"]
+    if "sonnet" in m: return PRICING["claude-sonnet-4-6"]
+    if "haiku" in m:  return PRICING["claude-haiku-4-5"]
+    return None
 
 def calc_cost(model, inp, out, cache_read, cache_creation):
     p = get_pricing(model)
+    if not p:
+        return 0.0
     return (
-        inp          * p["input"]  / 1_000_000 +
-        out          * p["output"] / 1_000_000 +
-        cache_read   * p["input"]  * 0.10 / 1_000_000 +
-        cache_creation * p["input"] * 1.25 / 1_000_000
+        inp            * p["input"]       / 1_000_000 +
+        out            * p["output"]      / 1_000_000 +
+        cache_read     * p["cache_read"]  / 1_000_000 +
+        cache_creation * p["cache_write"] / 1_000_000
     )
 
 def fmt(n):
