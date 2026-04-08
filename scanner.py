@@ -76,6 +76,7 @@ def parse_jsonl_file(filepath):
     """Parse a JSONL file and yield (session_data, turns) tuples."""
     turns = []
     session_meta = {}  # session_id -> dict
+    seen_messages = {}  # message_id -> turn (dedup streaming records)
 
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
@@ -123,6 +124,7 @@ def parse_jsonl_file(filepath):
                     msg = record.get("message", {})
                     usage = msg.get("usage", {})
                     model = msg.get("model", "")
+                    message_id = msg.get("id", "")
 
                     input_tokens = usage.get("input_tokens", 0) or 0
                     output_tokens = usage.get("output_tokens", 0) or 0
@@ -143,7 +145,7 @@ def parse_jsonl_file(filepath):
                     if model:
                         session_meta[session_id]["model"] = model
 
-                    turns.append({
+                    turn = {
                         "session_id": session_id,
                         "timestamp": timestamp,
                         "model": model,
@@ -153,11 +155,20 @@ def parse_jsonl_file(filepath):
                         "cache_creation_tokens": cache_creation,
                         "tool_name": tool_name,
                         "cwd": cwd,
-                    })
+                    }
+
+                    # Deduplicate by message ID — Claude Code logs multiple
+                    # JSONL records per API response (streaming events).
+                    # Keep only the last record per message ID (final usage).
+                    if message_id:
+                        seen_messages[message_id] = turn
+                    else:
+                        turns.append(turn)
 
     except Exception as e:
         print(f"  Warning: error reading {filepath}: {e}")
 
+    turns.extend(seen_messages.values())
     return list(session_meta.values()), turns
 
 
@@ -309,6 +320,7 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
                 # Only process the new lines
                 new_turns = []
                 new_metas = {}
+                new_seen_messages = {}
                 try:
                     with open(filepath, encoding="utf-8", errors="replace") as f:
                         for i, line in enumerate(f):
@@ -332,6 +344,7 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
 
                             msg = record.get("message", {})
                             usage = msg.get("usage", {})
+                            message_id = msg.get("id", "")
                             input_tokens = usage.get("input_tokens", 0) or 0
                             output_tokens = usage.get("output_tokens", 0) or 0
                             cache_read = usage.get("cache_read_input_tokens", 0) or 0
@@ -346,7 +359,7 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
                                     tool_name = item.get("name")
                                     break
 
-                            new_turns.append({
+                            turn = {
                                 "session_id": session_id,
                                 "timestamp": record.get("timestamp", ""),
                                 "model": msg.get("model", ""),
@@ -356,9 +369,16 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
                                 "cache_creation_tokens": cache_creation,
                                 "tool_name": tool_name,
                                 "cwd": record.get("cwd", ""),
-                            })
+                            }
+
+                            if message_id:
+                                new_seen_messages[message_id] = turn
+                            else:
+                                new_turns.append(turn)
                 except Exception as e:
                     print(f"  Warning: {e}")
+
+                new_turns.extend(new_seen_messages.values())
 
                 turns = new_turns
                 sessions = aggregate_sessions(list(new_metas.values()) or [], turns)
